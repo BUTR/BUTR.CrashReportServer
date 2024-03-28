@@ -7,6 +7,7 @@ using BUTR.CrashReportServer.Services;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Formatters;
+using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -23,7 +24,6 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Microsoft.AspNetCore.ResponseCompression;
 
 namespace BUTR.CrashReportServer;
 
@@ -131,7 +131,7 @@ public class Startup
             options.Level = CompressionLevel.SmallestSize;
         });
         */
-        
+
         services.AddResponseCaching();
     }
 
