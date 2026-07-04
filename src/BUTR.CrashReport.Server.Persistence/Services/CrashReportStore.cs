@@ -5,8 +5,10 @@ using BUTR.CrashReport.Server.Options;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using Microsoft.IO;
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics.Metrics;
 using System.IO;
@@ -23,6 +25,7 @@ public sealed class CrashReportStore
     private readonly AppDbContext _dbContext;
     private readonly ZstdCompressionService _zstd;
     private readonly FileIdGenerator _fileIdGenerator;
+    private readonly RecyclableMemoryStreamManager _streamManager;
     private readonly Counter<int> _reportTenant;
     private readonly Counter<int> _reportVersion;
     private CrashUploadOptions _options;
@@ -32,11 +35,13 @@ public sealed class CrashReportStore
         AppDbContext dbContext,
         ZstdCompressionService zstd,
         FileIdGenerator fileIdGenerator,
+        RecyclableMemoryStreamManager streamManager,
         IMeterFactory meterFactory)
     {
         _dbContext = dbContext ?? throw new ArgumentNullException(nameof(dbContext));
         _zstd = zstd ?? throw new ArgumentNullException(nameof(zstd));
         _fileIdGenerator = fileIdGenerator ?? throw new ArgumentNullException(nameof(fileIdGenerator));
+        _streamManager = streamManager ?? throw new ArgumentNullException(nameof(streamManager));
 
         var meter = meterFactory.Create("BUTR.CrashReportServer.Controllers.CrashUploadController", "1.0.0");
         _reportTenant = meter.CreateCounter<int>("report-tenant", unit: "Count");
@@ -57,15 +62,26 @@ public sealed class CrashReportStore
         short? htmlDictId = null;
         if (htmlStream is not null)
         {
-            using var htmlBuffer = new MemoryStream();
+            await using var htmlBuffer = _streamManager.GetStream();
             await htmlStream.CopyToAsync(htmlBuffer, ct);
-            (htmlCompressed, htmlDictId) = await _zstd.CompressAsync(htmlBuffer.ToArray(), tenant, CompressionDictionaryKind.Html, version, ct);
+            (htmlCompressed, htmlDictId) = await _zstd.CompressAsync(htmlBuffer.GetBuffer().AsMemory(0, (int) htmlBuffer.Length), tenant, CompressionDictionaryKind.Html, version, ct);
         }
 
         byte[]? jsonCompressed = null;
         short? jsonDictId = null;
         if (json is not null)
-            (jsonCompressed, jsonDictId) = await _zstd.CompressAsync(Encoding.UTF8.GetBytes(json), tenant, CompressionDictionaryKind.Json, version, ct);
+        {
+            var jsonBuffer = ArrayPool<byte>.Shared.Rent(Encoding.UTF8.GetByteCount(json));
+            try
+            {
+                var written = Encoding.UTF8.GetBytes(json, jsonBuffer);
+                (jsonCompressed, jsonDictId) = await _zstd.CompressAsync(jsonBuffer.AsMemory(0, written), tenant, CompressionDictionaryKind.Json, version, ct);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(jsonBuffer);
+            }
+        }
 
         var result = await _dbContext
             .InsertCrashReport(crashReportId, tenant, version, created, deleteTokenHash, fileIds, htmlCompressed, htmlDictId, jsonCompressed, jsonDictId)

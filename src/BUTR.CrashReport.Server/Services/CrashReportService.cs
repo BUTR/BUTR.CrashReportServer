@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.OutputCaching;
 using Microsoft.EntityFrameworkCore;
 
 using System;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -25,7 +26,11 @@ public sealed class CrashReportService
         _outputCacheStore = outputCacheStore ?? throw new ArgumentNullException(nameof(outputCacheStore));
     }
 
-    public async Task<byte[]?> GetHtmlAsync(byte tenant, string filename, CancellationToken ct)
+    /// <summary>
+    /// Returns the report body in a pooled stream positioned at 0; the caller must dispose it to return the
+    /// buffers to the pool (returning it as a <see cref="Microsoft.AspNetCore.Mvc.FileStreamResult"/> does that).
+    /// </summary>
+    public async Task<MemoryStream?> GetHtmlAsync(byte tenant, string filename, CancellationToken ct)
     {
         if (await _dbContext.HtmlEntities
                 .Where(x => ResolveCrashReportIdQuery(tenant, filename).Contains(x.CrashReportId))
@@ -35,10 +40,11 @@ public sealed class CrashReportService
 
         return file.DictId is { } dictId
             ? await _zstd.DecompressAsync(file.DataCompressed, dictId, ct)
-            : (await _gZipCompressor.DecompressAsync(file.DataCompressed, ct)).ToArray();
+            : await _gZipCompressor.DecompressAsync(file.DataCompressed, ct);
     }
 
-    public async Task<byte[]?> GetJsonAsync(byte tenant, string filename, CancellationToken ct)
+    /// <inheritdoc cref="GetHtmlAsync"/>
+    public async Task<MemoryStream?> GetJsonAsync(byte tenant, string filename, CancellationToken ct)
     {
         if (await _dbContext.JsonEntities
                 .Where(x => ResolveCrashReportIdQuery(tenant, filename).Contains(x.CrashReportId))

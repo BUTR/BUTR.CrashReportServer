@@ -77,13 +77,10 @@ public sealed class LegacyHtmlToJsonMigrator
                 var originalCompressed = htmlEntity.DataCompressed;
 
                 byte[] originalBytes;
-                if (htmlEntity.DictId is { } dictId)
                 {
-                    originalBytes = await _zstd.DecompressAsync(originalCompressed, dictId, ct);
-                }
-                else
-                {
-                    await using var decompressed = await _gZipCompressor.DecompressAsync(originalCompressed, ct);
+                    await using var decompressed = htmlEntity.DictId is { } dictId
+                        ? await _zstd.DecompressAsync(originalCompressed, dictId, ct)
+                        : await _gZipCompressor.DecompressAsync(originalCompressed, ct);
                     originalBytes = decompressed.ToArray();
                 }
                 var original = Encoding.UTF8.GetString(originalBytes);

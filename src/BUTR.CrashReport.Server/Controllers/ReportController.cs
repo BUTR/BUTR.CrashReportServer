@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.OutputCaching;
+using Microsoft.IO;
 
 using System;
 using System.IO;
@@ -22,10 +23,12 @@ namespace BUTR.CrashReport.Server.Controllers;
 public class ReportController : ControllerBase
 {
     private readonly CrashReportService _reports;
+    private readonly RecyclableMemoryStreamManager _streamManager;
 
-    public ReportController(CrashReportService reports)
+    public ReportController(CrashReportService reports, RecyclableMemoryStreamManager streamManager)
     {
         _reports = reports ?? throw new ArgumentNullException(nameof(reports));
+        _streamManager = streamManager ?? throw new ArgumentNullException(nameof(streamManager));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -66,7 +69,7 @@ public class ReportController : ControllerBase
         return TranscodedResult(json, "application/json; charset=utf-8");
     }
 
-    private FileContentResult TranscodedResult(byte[] body, string contentType)
+    private FileStreamResult TranscodedResult(MemoryStream body, string contentType)
     {
         var acceptEncoding = Request.GetTypedHeaders().AcceptEncoding;
         bool Accepts(string encoding) => acceptEncoding.Any(x => x.Value.Equals(encoding, StringComparison.OrdinalIgnoreCase));
@@ -74,32 +77,36 @@ public class ReportController : ControllerBase
         if (Accepts("br"))
         {
             Response.Headers.ContentEncoding = "br";
-            return File(BrotliCompress(body), contentType, false);
+            return File(Transcode(body, output => new BrotliStream(output, _brotliOptions, leaveOpen: true)), contentType);
         }
         if (Accepts("gzip"))
         {
             Response.Headers.ContentEncoding = "gzip";
-            return File(GzipCompress(body), contentType, false);
+            return File(Transcode(body, output => new GZipStream(output, CompressionLevel.SmallestSize, leaveOpen: true)), contentType);
         }
-        return File(body, contentType, false);
+        return File(body, contentType);
     }
 
     private static readonly BrotliCompressionOptions _brotliOptions = new() { Quality = 5 };
 
-    private static byte[] BrotliCompress(byte[] data)
+    private MemoryStream Transcode(MemoryStream body, Func<Stream, Stream> createEncoder)
     {
-        using var output = new MemoryStream();
-        using (var brotli = new BrotliStream(output, _brotliOptions, leaveOpen: true))
-            brotli.Write(data, 0, data.Length);
-        return output.ToArray();
-    }
-
-    private static byte[] GzipCompress(byte[] data)
-    {
-        using var output = new MemoryStream();
-        using (var gzip = new GZipStream(output, CompressionLevel.SmallestSize, leaveOpen: true))
-            gzip.Write(data, 0, data.Length);
-        return output.ToArray();
+        using (body)
+        {
+            var output = _streamManager.GetStream();
+            try
+            {
+                using (var encoder = createEncoder(output))
+                    body.CopyTo(encoder);
+                output.Position = 0;
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+        }
     }
 
     [AllowAnonymous]

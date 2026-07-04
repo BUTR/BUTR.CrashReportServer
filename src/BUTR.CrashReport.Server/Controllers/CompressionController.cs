@@ -5,10 +5,10 @@ using BUTR.CrashReport.Server.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.IO;
 
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Security.Authentication;
 using System.Threading;
 using System.Threading.Tasks;
@@ -24,10 +24,12 @@ public class CompressionController : ControllerBase
     private const long MaxDictionaryBytes = 32 * 1024 * 1024;
 
     private readonly DictionaryService _dictionaries;
+    private readonly RecyclableMemoryStreamManager _streamManager;
 
-    public CompressionController(DictionaryService dictionaries)
+    public CompressionController(DictionaryService dictionaries, RecyclableMemoryStreamManager streamManager)
     {
         _dictionaries = dictionaries ?? throw new ArgumentNullException(nameof(dictionaries));
+        _streamManager = streamManager ?? throw new ArgumentNullException(nameof(streamManager));
     }
 
     [HttpGet("dictionaries")]
@@ -70,7 +72,7 @@ public class CompressionController : ControllerBase
             return buffer;
         }
 
-        using var ms = new MemoryStream();
+        await using var ms = _streamManager.GetStream();
         var chunk = new byte[81920];
         int read;
         while ((read = await Request.Body.ReadAsync(chunk, ct)) > 0)

@@ -1,13 +1,16 @@
-﻿using BUTR.CrashReport.Server.Contexts;
+using BUTR.CrashReport.Server.Contexts;
 using BUTR.CrashReport.Server.Models.Database;
 using BUTR.CrashReport.Server.Options;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.ObjectPool;
 using Microsoft.Extensions.Options;
+using Microsoft.IO;
 
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -24,32 +27,44 @@ public sealed class ZstdCompressionService
 
     private const int NoDict = -1;
 
+    private const int MaxPooledCodecs = 2;
     private readonly IDbContextFactory<AppDbContext> _dbContextFactory;
     private readonly IOptionsMonitor<CompressionOptions> _options;
+    private readonly RecyclableMemoryStreamManager _streamManager;
 
     private readonly ConcurrentDictionary<short, Task<byte[]>> _dictBytes = new();
     private readonly ConcurrentDictionary<(byte Tenant, byte Kind, byte Group), (short DictId, long ExpiresTick)> _activeDict = new();
     private readonly ConcurrentDictionary<(int DictKey, int Level), ObjectPool<Compressor>> _compressorPools = new();
     private readonly ConcurrentDictionary<int, ObjectPool<Decompressor>> _decompressorPools = new();
 
-    public ZstdCompressionService(IDbContextFactory<AppDbContext> dbContextFactory, IOptionsMonitor<CompressionOptions> options)
+    public ZstdCompressionService(IDbContextFactory<AppDbContext> dbContextFactory, IOptionsMonitor<CompressionOptions> options, RecyclableMemoryStreamManager streamManager)
     {
         _dbContextFactory = dbContextFactory ?? throw new ArgumentNullException(nameof(dbContextFactory));
         _options = options ?? throw new ArgumentNullException(nameof(options));
+        _streamManager = streamManager ?? throw new ArgumentNullException(nameof(streamManager));
     }
 
-    public async Task<(byte[] Compressed, short DictId)> CompressAsync(byte[] data, byte tenant, CompressionDictionaryKind kind, byte version, CancellationToken ct)
+    public async Task<(byte[] Compressed, short DictId)> CompressAsync(ReadOnlyMemory<byte> data, byte tenant, CompressionDictionaryKind kind, byte version, CancellationToken ct)
     {
         var dictId = await GetActiveDictIdAsync(tenant, kind, GroupFor(version), ct).ConfigureAwait(false);
         var dictBytes = await GetDictBytesAsync(dictId, ct).ConfigureAwait(false);
 
         var pool = _compressorPools.GetOrAdd((dictId, _options.CurrentValue.Level),
-            static (key, dict) => new DefaultObjectPool<Compressor>(new CompressorPolicy(key.Level, dict)), dictBytes);
+            static (key, dict) => new DefaultObjectPool<Compressor>(new CompressorPolicy(key.Level, dict), MaxPooledCodecs), dictBytes);
 
         var compressor = pool.Get();
         try
         {
-            return (compressor.Wrap(data).ToArray(), dictId);
+            var scratch = ArrayPool<byte>.Shared.Rent(Compressor.GetCompressBound(data.Length));
+            try
+            {
+                var written = compressor.Wrap(data.Span, scratch);
+                return (scratch.AsSpan(0, written).ToArray(), dictId);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(scratch);
+            }
         }
         finally
         {
@@ -57,17 +72,46 @@ public sealed class ZstdCompressionService
         }
     }
 
-    public async Task<byte[]> DecompressAsync(byte[] compressed, short? dictId, CancellationToken ct)
+    /// <summary>
+    /// Decompresses into a pooled <see cref="RecyclableMemoryStream"/> positioned at 0. The caller owns the
+    /// stream and must dispose it to return the buffers to the pool.
+    /// </summary>
+    public async Task<MemoryStream> DecompressAsync(byte[] compressed, short? dictId, CancellationToken ct)
     {
         var dictBytes = dictId is { } id ? await GetDictBytesAsync(id, ct).ConfigureAwait(false) : null;
 
         var pool = _decompressorPools.GetOrAdd(dictId ?? NoDict,
-            static (_, dict) => new DefaultObjectPool<Decompressor>(new DecompressorPolicy(dict)), dictBytes);
+            static (_, dict) => new DefaultObjectPool<Decompressor>(new DecompressorPolicy(dict), MaxPooledCodecs), dictBytes);
 
         var decompressor = pool.Get();
         try
         {
-            return decompressor.Unwrap(compressed).ToArray();
+            // Frames written by CompressAsync always embed the content size, so decompress straight into a
+            // right-sized contiguous pooled buffer instead of letting the library allocate a fresh array.
+            var size = Decompressor.GetDecompressedSize(compressed);
+            if (size is 0 or > int.MaxValue)
+            {
+                // Unknown content size (foreign frame) or genuinely empty - let the library size it.
+                var data = decompressor.Unwrap(compressed);
+                var fallback = _streamManager.GetStream(nameof(ZstdCompressionService), data.Length);
+                fallback.Write(data);
+                fallback.Position = 0;
+                return fallback;
+            }
+
+            var stream = _streamManager.GetStream(nameof(ZstdCompressionService), (long) size, asContiguousBuffer: true);
+            try
+            {
+                stream.SetLength((long) size);
+                var written = decompressor.Unwrap(compressed, stream.GetBuffer().AsSpan(0, (int) size));
+                stream.SetLength(written);
+                return stream;
+            }
+            catch
+            {
+                await stream.DisposeAsync();
+                throw;
+            }
         }
         finally
         {

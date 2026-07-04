@@ -86,7 +86,6 @@ public class Startup
         services.AddSingleton<GZipCompressor>();
         services.AddSingleton<ZstdCompressionService>();
         services.AddScoped<DictionaryService>();
-        services.AddHostedService<CompressionBackfillService>();
         //services.AddHostedService<DatabaseMigrator>();
 
         services.AddPooledDbContextFactory<AppDbContext>(x => x
@@ -172,6 +171,8 @@ public class Startup
         // evicted by tag when a report is deleted (see ReportOutputCachePolicy / ReportController).
         services.AddOutputCache(options =>
         {
+            options.SizeLimit = 32 * 1024 * 1024;
+            options.MaximumBodySize = 8 * 1024 * 1024;
             options.AddPolicy(ReportsCachePolicyName, builder => builder.AddPolicy<ReportOutputCachePolicy>());
         });
 
