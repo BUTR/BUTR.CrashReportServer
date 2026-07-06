@@ -35,6 +35,18 @@ public sealed class GZipCompressor
         await using var compressedStream = _streamManager.GetStream(data);
         return await DecompressAsync(compressedStream, ct);
     }
+
+    /// <summary>
+    /// Opens a read-only, forward-only stream that gunzips <paramref name="data"/> incrementally as it is read,
+    /// without materializing the whole decompressed body. The caller must dispose the returned stream (which disposes
+    /// the underlying compressed source). Legacy read path counterpart to <see cref="ZstdCompressionService"/>'s streaming decompressor.
+    /// </summary>
+    public Stream OpenDecompressionStream(byte[] data)
+    {
+        // The compressed bytes are already fully in managed memory (small); wrap without copying and gunzip on read.
+        var source = new MemoryStream(data, writable: false);
+        return new GZipStream(source, CompressionMode.Decompress, leaveOpen: false);
+    }
     public async Task<MemoryStream> DecompressAsync(Stream compressedStream, CancellationToken ct)
     {
         var decompressedStream = _streamManager.GetStream();

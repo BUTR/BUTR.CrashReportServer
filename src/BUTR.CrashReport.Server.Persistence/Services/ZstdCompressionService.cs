@@ -119,6 +119,41 @@ public sealed class ZstdCompressionService
         }
     }
 
+    /// <summary>
+    /// Opens a read-only, forward-only stream that decompresses <paramref name="compressed"/> incrementally as it is
+    /// read. Unlike <see cref="DecompressAsync"/> this never materializes the whole decompressed body - a multi-MB
+    /// report flows through in fixed-size chunks (peak transient memory is the codec's input buffer plus the caller's
+    /// read buffer), which is what keeps a large report from blowing the container memory limit on the read path.
+    /// The returned stream borrows a pooled (dictionary-primed) <see cref="Decompressor"/>; disposing it resets that
+    /// codec's session and returns it to the pool. The caller must dispose the stream.
+    /// </summary>
+    public async Task<Stream> OpenDecompressionStreamAsync(byte[] compressed, short? dictId, CancellationToken ct)
+    {
+        var dictBytes = dictId is { } id ? await GetDictBytesAsync(id, ct).ConfigureAwait(false) : null;
+
+        var pool = _decompressorPools.GetOrAdd(dictId ?? NoDict,
+            static (_, dict) => new DefaultObjectPool<Decompressor>(new DecompressorPolicy(dict), MaxPooledCodecs), dictBytes);
+
+        var decompressor = pool.Get();
+        // The compressed bytes are already fully in managed memory (small); wrap them without copying. The
+        // DecompressionStream reads from this and pulls decompressed output on demand.
+        var source = new MemoryStream(compressed, writable: false);
+        try
+        {
+            // preserveDecompressor keeps our pooled codec (with its digested dictionary) alive when the stream is
+            // disposed - PooledDecompressionStream resets and returns it instead.
+            var inner = new DecompressionStream(source, decompressor, bufferSize: 0, checkEndOfStream: true, preserveDecompressor: true, leaveOpen: true);
+            return new PooledDecompressionStream(inner, source, decompressor, pool);
+        }
+        catch
+        {
+            decompressor.ResetStream();
+            pool.Return(decompressor);
+            source.Dispose();
+            throw;
+        }
+    }
+
     private async Task<short> GetActiveDictIdAsync(byte tenant, CompressionDictionaryKind kind, byte group, CancellationToken ct)
     {
         var key = (tenant, (byte) kind, group);
@@ -187,5 +222,60 @@ public sealed class ZstdCompressionService
         }
 
         public bool Return(Decompressor obj) => true;
+    }
+
+    // Forward-only view over a DecompressionStream that owns the lifetime of a pooled decompressor and the compressed
+    // source. On dispose it resets the codec's session (cheap; clears any half-consumed frame left by an aborted read,
+    // and keeps the digested dictionary) and returns it to the pool so the native dictionary memory is reused.
+    private sealed class PooledDecompressionStream(DecompressionStream inner, MemoryStream source, Decompressor decompressor, ObjectPool<Decompressor> pool) : Stream
+    {
+        private bool _returned;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+
+        public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
+        public override int Read(Span<byte> buffer) => inner.Read(buffer);
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) => inner.ReadAsync(buffer, offset, count, cancellationToken);
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) => inner.ReadAsync(buffer, cancellationToken);
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        private void ReturnDecompressor()
+        {
+            if (_returned) return;
+            _returned = true;
+            // preserveDecompressor was set, so disposing inner returns its rented input buffer but leaves our codec alive.
+            decompressor.ResetStream();
+            pool.Return(decompressor);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && !_returned)
+            {
+                inner.Dispose();
+                ReturnDecompressor();
+                source.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            if (!_returned)
+            {
+                await inner.DisposeAsync().ConfigureAwait(false);
+                ReturnDecompressor();
+                await source.DisposeAsync().ConfigureAwait(false);
+            }
+            await base.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }

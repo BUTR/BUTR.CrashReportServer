@@ -55,7 +55,7 @@ public class ReportController : ControllerBase
         if (await _reports.GetHtmlAsync(tenant, filename, ct) is not { } html)
             return StatusCode(StatusCodes.Status404NotFound);
 
-        return TranscodedResult(html, "text/html; charset=utf-8");
+        return await TranscodedResult(html, "text/html; charset=utf-8", ct);
     }
 
     private async Task<IActionResult> GetJson(byte tenant, string filename, CancellationToken ct)
@@ -66,10 +66,10 @@ public class ReportController : ControllerBase
         if (await _reports.GetJsonAsync(tenant, filename, ct) is not { } json)
             return StatusCode(StatusCodes.Status404NotFound);
 
-        return TranscodedResult(json, "application/json; charset=utf-8");
+        return await TranscodedResult(json, "application/json; charset=utf-8", ct);
     }
 
-    private FileStreamResult TranscodedResult(MemoryStream body, string contentType)
+    private async Task<IActionResult> TranscodedResult(Stream body, string contentType, CancellationToken ct)
     {
         var acceptEncoding = Request.GetTypedHeaders().AcceptEncoding;
         bool Accepts(string encoding) => acceptEncoding.Any(x => x.Value.Equals(encoding, StringComparison.OrdinalIgnoreCase));
@@ -77,33 +77,33 @@ public class ReportController : ControllerBase
         if (Accepts("br"))
         {
             Response.Headers.ContentEncoding = "br";
-            return File(Transcode(body, output => new BrotliStream(output, _brotliOptions, leaveOpen: true)), contentType);
+            return File(await Transcode(body, output => new BrotliStream(output, _brotliOptions, leaveOpen: true), ct), contentType);
         }
         if (Accepts("gzip"))
         {
             Response.Headers.ContentEncoding = "gzip";
-            return File(Transcode(body, output => new GZipStream(output, CompressionLevel.SmallestSize, leaveOpen: true)), contentType);
+            return File(await Transcode(body, output => new GZipStream(output, CompressionLevel.SmallestSize, leaveOpen: true), ct), contentType);
         }
         return File(body, contentType);
     }
 
     private static readonly BrotliCompressionOptions _brotliOptions = new() { Quality = 5 };
 
-    private MemoryStream Transcode(MemoryStream body, Func<Stream, Stream> createEncoder)
+    private async Task<MemoryStream> Transcode(Stream body, Func<Stream, Stream> createEncoder, CancellationToken ct)
     {
-        using (body)
+        await using (body)
         {
             var output = _streamManager.GetStream();
             try
             {
-                using (var encoder = createEncoder(output))
-                    body.CopyTo(encoder);
+                await using (var encoder = createEncoder(output))
+                    await body.CopyToAsync(encoder, ct);
                 output.Position = 0;
                 return output;
             }
             catch
             {
-                output.Dispose();
+                await output.DisposeAsync();
                 throw;
             }
         }

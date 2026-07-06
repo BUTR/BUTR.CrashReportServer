@@ -27,10 +27,11 @@ public sealed class CrashReportService
     }
 
     /// <summary>
-    /// Returns the report body in a pooled stream positioned at 0; the caller must dispose it to return the
-    /// buffers to the pool (returning it as a <see cref="Microsoft.AspNetCore.Mvc.FileStreamResult"/> does that).
+    /// Returns the report body as a forward-only stream that decompresses on read; the caller must dispose it
+    /// (returning it as a <see cref="Microsoft.AspNetCore.Mvc.FileStreamResult"/> does that). The body is never
+    /// fully materialized in memory - it streams through in chunks so a large report can't blow the container limit.
     /// </summary>
-    public async Task<MemoryStream?> GetHtmlAsync(byte tenant, string filename, CancellationToken ct)
+    public async Task<Stream?> GetHtmlAsync(byte tenant, string filename, CancellationToken ct)
     {
         if (await _dbContext.HtmlEntities
                 .Where(x => ResolveCrashReportIdQuery(tenant, filename).Contains(x.CrashReportId))
@@ -39,12 +40,12 @@ public sealed class CrashReportService
             return null;
 
         return file.DictId is { } dictId
-            ? await _zstd.DecompressAsync(file.DataCompressed, dictId, ct)
-            : await _gZipCompressor.DecompressAsync(file.DataCompressed, ct);
+            ? await _zstd.OpenDecompressionStreamAsync(file.DataCompressed, dictId, ct)
+            : _gZipCompressor.OpenDecompressionStream(file.DataCompressed);
     }
 
     /// <inheritdoc cref="GetHtmlAsync"/>
-    public async Task<MemoryStream?> GetJsonAsync(byte tenant, string filename, CancellationToken ct)
+    public async Task<Stream?> GetJsonAsync(byte tenant, string filename, CancellationToken ct)
     {
         if (await _dbContext.JsonEntities
                 .Where(x => ResolveCrashReportIdQuery(tenant, filename).Contains(x.CrashReportId))
@@ -52,7 +53,7 @@ public sealed class CrashReportService
                 .FirstOrDefaultAsync(ct) is not { } file)
             return null;
 
-        return await _zstd.DecompressAsync(file.DataCompressed, file.DictId, ct);
+        return await _zstd.OpenDecompressionStreamAsync(file.DataCompressed, file.DictId, ct);
     }
 
     public async Task<byte[]?> GetTokenHashAsync(byte tenant, string filename, CancellationToken ct)
