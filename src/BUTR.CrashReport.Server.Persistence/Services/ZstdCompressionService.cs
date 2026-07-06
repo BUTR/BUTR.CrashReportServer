@@ -27,7 +27,9 @@ public sealed class ZstdCompressionService
 
     private const int NoDict = -1;
 
-    private const int MaxPooledCodecs = 2;
+    private readonly ObjectPoolProvider _compressorPoolProvider;
+    private readonly ObjectPoolProvider _decompressorPoolProvider;
+
     private readonly IDbContextFactory<AppDbContext> _dbContextFactory;
     private readonly IOptionsMonitor<CompressionOptions> _options;
     private readonly RecyclableMemoryStreamManager _streamManager;
@@ -42,6 +44,9 @@ public sealed class ZstdCompressionService
         _dbContextFactory = dbContextFactory ?? throw new ArgumentNullException(nameof(dbContextFactory));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _streamManager = streamManager ?? throw new ArgumentNullException(nameof(streamManager));
+        var opts = _options.CurrentValue;
+        _compressorPoolProvider = new DefaultObjectPoolProvider { MaximumRetained = Math.Max(1, opts.MaxPooledCompressors) };
+        _decompressorPoolProvider = new DefaultObjectPoolProvider { MaximumRetained = Math.Max(1, opts.MaxPooledDecompressors) };
     }
 
     public async Task<(byte[] Compressed, short DictId)> CompressAsync(ReadOnlyMemory<byte> data, byte tenant, CompressionDictionaryKind kind, byte version, CancellationToken ct)
@@ -50,7 +55,7 @@ public sealed class ZstdCompressionService
         var dictBytes = await GetDictBytesAsync(dictId, ct).ConfigureAwait(false);
 
         var pool = _compressorPools.GetOrAdd((dictId, _options.CurrentValue.Level),
-            static (key, dict) => new DefaultObjectPool<Compressor>(new CompressorPolicy(key.Level, dict), MaxPooledCodecs), dictBytes);
+            (key, dict) => _compressorPoolProvider.Create(new CompressorPolicy(key.Level, dict)), dictBytes);
 
         var compressor = pool.Get();
         try
@@ -81,7 +86,7 @@ public sealed class ZstdCompressionService
         var dictBytes = dictId is { } id ? await GetDictBytesAsync(id, ct).ConfigureAwait(false) : null;
 
         var pool = _decompressorPools.GetOrAdd(dictId ?? NoDict,
-            static (_, dict) => new DefaultObjectPool<Decompressor>(new DecompressorPolicy(dict), MaxPooledCodecs), dictBytes);
+            (_, dict) => _decompressorPoolProvider.Create(new DecompressorPolicy(dict)), dictBytes);
 
         var decompressor = pool.Get();
         try
@@ -132,7 +137,7 @@ public sealed class ZstdCompressionService
         var dictBytes = dictId is { } id ? await GetDictBytesAsync(id, ct).ConfigureAwait(false) : null;
 
         var pool = _decompressorPools.GetOrAdd(dictId ?? NoDict,
-            static (_, dict) => new DefaultObjectPool<Decompressor>(new DecompressorPolicy(dict), MaxPooledCodecs), dictBytes);
+            (_, dict) => _decompressorPoolProvider.Create(new DecompressorPolicy(dict)), dictBytes);
 
         var decompressor = pool.Get();
         // The compressed bytes are already fully in managed memory (small); wrap them without copying. The
