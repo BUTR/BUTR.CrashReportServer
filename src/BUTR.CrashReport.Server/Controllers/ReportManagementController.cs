@@ -6,6 +6,7 @@ using BUTR.CrashReport.Server.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 using System;
 using System.Collections.Generic;
@@ -53,7 +54,12 @@ public class ReportManagementController : ControllerBase
     [ProducesResponseType(typeof(string[]), StatusCodes.Status200OK, "application/json")]
     [ProducesResponseType(typeof(void), StatusCodes.Status500InternalServerError, "application/problem+json")]
     [ProducesResponseType(typeof(TLSError), StatusCodes.Status400BadRequest, "application/json")]
-    public ActionResult<IAsyncEnumerable<string>> GetAllFilenames(byte tenant) => Ok(_dbContext.ReportEntities.Where(x => x.Tenant == tenant).Select(x => x.FileId));
+    public IAsyncEnumerable<string> GetAllFilenames(byte tenant) =>
+        _dbContext.ReportEntities
+            .AsNoTracking()
+            .Where(x => x.Tenant == tenant)
+            .Select(x => x.FileId)
+            .AsAsyncEnumerable();
 
     [HttpPost("{tenant:int}/GetMetadata")]
     [ProducesResponseType(typeof(FileMetadata[]), StatusCodes.Status200OK, "application/json")]
