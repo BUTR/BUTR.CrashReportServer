@@ -3,7 +3,11 @@
 using Microsoft.AspNetCore.OutputCaching;
 using Microsoft.EntityFrameworkCore;
 
+using Npgsql;
+
 using System;
+using System.Data;
+using System.Data.Common;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -14,46 +18,71 @@ namespace BUTR.CrashReport.Server.Services;
 public sealed class CrashReportService
 {
     private readonly AppDbContext _dbContext;
+    private readonly NpgsqlDataSource _dataSource;
+    private readonly ReportBlobSchema _blobSchema;
     private readonly GZipCompressor _gZipCompressor;
     private readonly ZstdCompressionService _zstd;
     private readonly IOutputCacheStore _outputCacheStore;
 
-    public CrashReportService(AppDbContext dbContext, GZipCompressor gZipCompressor, ZstdCompressionService zstd, IOutputCacheStore outputCacheStore)
+    public CrashReportService(AppDbContext dbContext, NpgsqlDataSource dataSource, ReportBlobSchema blobSchema, GZipCompressor gZipCompressor, ZstdCompressionService zstd, IOutputCacheStore outputCacheStore)
     {
         _dbContext = dbContext ?? throw new ArgumentNullException(nameof(dbContext));
+        _dataSource = dataSource ?? throw new ArgumentNullException(nameof(dataSource));
+        _blobSchema = blobSchema ?? throw new ArgumentNullException(nameof(blobSchema));
         _gZipCompressor = gZipCompressor ?? throw new ArgumentNullException(nameof(gZipCompressor));
         _zstd = zstd ?? throw new ArgumentNullException(nameof(zstd));
         _outputCacheStore = outputCacheStore ?? throw new ArgumentNullException(nameof(outputCacheStore));
     }
 
-    /// <summary>
-    /// Returns the report body as a forward-only stream that decompresses on read; the caller must dispose it
-    /// (returning it as a <see cref="Microsoft.AspNetCore.Mvc.FileStreamResult"/> does that). The body is never
-    /// fully materialized in memory - it streams through in chunks so a large report can't blow the container limit.
-    /// </summary>
-    public async Task<Stream?> GetHtmlAsync(byte tenant, string filename, CancellationToken ct)
+    public Task<Stream?> GetHtmlAsync(byte tenant, string filename, CancellationToken ct) =>
+        OpenReportBodyAsync(_blobSchema.Html, isHtml: true, tenant, filename, ct);
+
+    public Task<Stream?> GetJsonAsync(byte tenant, string filename, CancellationToken ct) =>
+        OpenReportBodyAsync(_blobSchema.Json, isHtml: false, tenant, filename, ct);
+
+    private async Task<Stream?> OpenReportBodyAsync(ReportBlobSchema.BlobTable table, bool isHtml, byte tenant, string filename, CancellationToken ct)
     {
-        if (await _dbContext.HtmlEntities
-                .Where(x => ResolveCrashReportIdQuery(tenant, filename).Contains(x.CrashReportId))
-                .Select(x => new { x.DataCompressed, x.DictId })
-                .FirstOrDefaultAsync(ct) is not { } file)
+        if (await ResolveCrashReportIdAsync(tenant, filename, ct) is not { } crashReportId)
             return null;
 
-        return file.DictId is { } dictId
-            ? await _zstd.OpenDecompressionStreamAsync(file.DataCompressed, dictId, ct)
-            : _gZipCompressor.OpenDecompressionStream(file.DataCompressed);
-    }
+        var connection = await _dataSource.OpenConnectionAsync(ct);
+        var handedOff = false;
+        DbCommand? command = null;
+        DbDataReader? reader = null;
+        Stream? column = null;
+        try
+        {
+            command = connection.CreateCommand();
+            command.CommandText = $"SELECT {table.DictIdColumn}, {table.DataColumn} FROM {table.Table} WHERE {table.KeyColumn} = @id";
+            command.Parameters.Add(new NpgsqlParameter("id", crashReportId));
 
-    /// <inheritdoc cref="GetHtmlAsync"/>
-    public async Task<Stream?> GetJsonAsync(byte tenant, string filename, CancellationToken ct)
-    {
-        if (await _dbContext.JsonEntities
-                .Where(x => ResolveCrashReportIdQuery(tenant, filename).Contains(x.CrashReportId))
-                .Select(x => new { x.DataCompressed, x.DictId })
-                .FirstOrDefaultAsync(ct) is not { } file)
-            return null;
+            reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess | CommandBehavior.SingleRow | CommandBehavior.SingleResult, ct);
+            if (!await reader.ReadAsync(ct))
+                return null;
 
-        return await _zstd.OpenDecompressionStreamAsync(file.DataCompressed, file.DictId, ct);
+            var dictId = await reader.IsDBNullAsync(0, ct) ? (short?) null : reader.GetFieldValue<short>(0);
+            column = reader.GetStream(1);
+
+            // html predates zstd: dict_id NULL means a legacy gzip blob; everything else (all json, current html) is
+            // zstd. The codec stream takes ownership of `column`; the returned stream owns the reader/command/connection.
+            var decompressed = isHtml && dictId is null
+                ? _gZipCompressor.OpenDecompressionStream(column)
+                : await _zstd.OpenDecompressionStreamAsync(column, dictId, ct);
+
+            var result = new DbReportStream(decompressed, reader, command, connection);
+            handedOff = true;
+            return result;
+        }
+        finally
+        {
+            if (!handedOff)
+            {
+                if (column is not null) await column.DisposeAsync();
+                if (reader is not null) await reader.DisposeAsync();
+                if (command is not null) await command.DisposeAsync();
+                await connection.DisposeAsync();
+            }
+        }
     }
 
     public async Task<byte[]?> GetTokenHashAsync(byte tenant, string filename, CancellationToken ct)
@@ -89,4 +118,51 @@ public sealed class CrashReportService
 
     private Task<Guid?> ResolveCrashReportIdAsync(byte tenant, string filename, CancellationToken ct) =>
         ResolveCrashReportIdQuery(tenant, filename).Select(x => (Guid?) x).FirstOrDefaultAsync(ct);
+
+    private sealed class DbReportStream(Stream inner, DbDataReader reader, DbCommand command, DbConnection connection) : Stream
+    {
+        private bool _disposed;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+
+        public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
+        public override int Read(Span<byte> buffer) => inner.Read(buffer);
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) => inner.ReadAsync(buffer, offset, count, cancellationToken);
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) => inner.ReadAsync(buffer, cancellationToken);
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && !_disposed)
+            {
+                _disposed = true;
+                inner.Dispose();       // disposes the codec and the underlying bytea column stream
+                reader.Dispose();
+                command.Dispose();
+                connection.Dispose();  // returns the connection to the NpgsqlDataSource pool
+            }
+            base.Dispose(disposing);
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            if (!_disposed)
+            {
+                _disposed = true;
+                await inner.DisposeAsync();
+                await reader.DisposeAsync();
+                await command.DisposeAsync();
+                await connection.DisposeAsync();
+            }
+            await base.DisposeAsync();
+        }
+    }
 }

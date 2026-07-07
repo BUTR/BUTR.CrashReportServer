@@ -26,6 +26,8 @@ using Microsoft.IO;
 using Microsoft.Net.Http.Headers;
 using Microsoft.OpenApi;
 
+using Npgsql;
+
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -92,6 +94,9 @@ public class Startup
             .UseNpgsql(_configuration.GetConnectionString("Main"), y => y.MigrationsAssembly("BUTR.CrashReport.Server"))
             .ReplaceService<IMigrationsSqlGenerator, CrashReportMigrationsSqlGenerator>()
             .ReplaceService<IRelationalAnnotationProvider, CrashReportAnnotationProvider>());
+
+        services.AddSingleton(_ => NpgsqlDataSource.Create(_configuration.GetConnectionString("Main")!));
+        services.AddSingleton<ReportBlobSchema>();
 
         services.AddSwaggerGen(opt =>
         {

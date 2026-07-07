@@ -132,7 +132,7 @@ public sealed class ZstdCompressionService
     /// The returned stream borrows a pooled (dictionary-primed) <see cref="Decompressor"/>; disposing it resets that
     /// codec's session and returns it to the pool. The caller must dispose the stream.
     /// </summary>
-    public async Task<Stream> OpenDecompressionStreamAsync(byte[] compressed, short? dictId, CancellationToken ct)
+    public async Task<Stream> OpenDecompressionStreamAsync(Stream compressedSource, short? dictId, CancellationToken ct)
     {
         var dictBytes = dictId is { } id ? await GetDictBytesAsync(id, ct).ConfigureAwait(false) : null;
 
@@ -140,21 +140,18 @@ public sealed class ZstdCompressionService
             (_, dict) => _decompressorPoolProvider.Create(new DecompressorPolicy(dict)), dictBytes);
 
         var decompressor = pool.Get();
-        // The compressed bytes are already fully in managed memory (small); wrap them without copying. The
-        // DecompressionStream reads from this and pulls decompressed output on demand.
-        var source = new MemoryStream(compressed, writable: false);
         try
         {
             // preserveDecompressor keeps our pooled codec (with its digested dictionary) alive when the stream is
-            // disposed - PooledDecompressionStream resets and returns it instead.
-            var inner = new DecompressionStream(source, decompressor, bufferSize: 0, checkEndOfStream: true, preserveDecompressor: true, leaveOpen: true);
-            return new PooledDecompressionStream(inner, source, decompressor, pool);
+            // disposed - PooledDecompressionStream resets and returns it instead. leaveOpen so we (not the inner
+            // stream) own compressedSource's disposal, sequenced after the codec is returned.
+            var inner = new DecompressionStream(compressedSource, decompressor, bufferSize: 0, checkEndOfStream: true, preserveDecompressor: true, leaveOpen: true);
+            return new PooledDecompressionStream(inner, compressedSource, decompressor, pool);
         }
         catch
         {
             decompressor.ResetStream();
             pool.Return(decompressor);
-            source.Dispose();
             throw;
         }
     }
@@ -232,7 +229,7 @@ public sealed class ZstdCompressionService
     // Forward-only view over a DecompressionStream that owns the lifetime of a pooled decompressor and the compressed
     // source. On dispose it resets the codec's session (cheap; clears any half-consumed frame left by an aborted read,
     // and keeps the digested dictionary) and returns it to the pool so the native dictionary memory is reused.
-    private sealed class PooledDecompressionStream(DecompressionStream inner, MemoryStream source, Decompressor decompressor, ObjectPool<Decompressor> pool) : Stream
+    private sealed class PooledDecompressionStream(DecompressionStream inner, Stream source, Decompressor decompressor, ObjectPool<Decompressor> pool) : Stream
     {
         private bool _returned;
 
